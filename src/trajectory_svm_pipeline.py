@@ -10,6 +10,116 @@ from sklearn.pipeline import make_pipeline
 from sklearn.metrics import classification_report, confusion_matrix
 from sklearn.svm import SVC
 import matplotlib.pyplot as plt
+import time
+from mpl_toolkits.mplot3d import Axes3D  # utile selon versions de matplotlib
+
+
+# ---- AUGMENTATION SOBRE (pas de rotation, pas de time-warp) ----
+from typing import Optional
+from sklearn.model_selection import GroupKFold
+
+_rng = np.random.RandomState(42)
+
+def jitter_xyz(xyz: np.ndarray, sigma_mm: float = 1.5,
+               rng: Optional[np.random.RandomState] = None) -> np.ndarray:
+    """Bruit gaussien i.i.d. (zéro-mean) sur chaque point, n'altère pas la longueur."""
+    rng = rng or _rng
+    return xyz + rng.normal(0.0, sigma_mm, size=xyz.shape)
+
+def scale_xyz(xyz: np.ndarray, scale_std: float = 0.03,
+              per_axis: bool = False,
+              rng: Optional[np.random.RandomState] = None) -> np.ndarray:
+    """
+    Mise à l'échelle douce autour de 1.0. Par défaut isotrope.
+    per_axis=True permet une petite anisotropie (X/Y/Z).
+    """
+    rng = rng or _rng
+    if per_axis:
+        s = rng.normal(1.0, scale_std, size=3)
+        s = np.clip(s, 0.9, 1.1)
+        return xyz * s
+    else:
+        s = float(np.clip(rng.normal(1.0, scale_std), 0.9, 1.1))
+        return xyz * s
+
+def augment_one_simple(xyz_resampled: np.ndarray,
+                       jitter_sigma_mm: float = 1.5,
+                       scale_std: float = 0.03,
+                       per_axis_scale: bool = False,
+                       rng: Optional[np.random.RandomState] = None) -> np.ndarray:
+    """
+    Chaîne d'augmentation minimaliste : (optionnel) scale -> (optionnel) jitter.
+    - Pas de rotation, pas de time-warp, pas de miroir par défaut.
+    - Conserve la longueur et l'ordre temporel.
+    """
+    rng = rng or _rng
+    P = xyz_resampled.astype(float, copy=True)
+    if scale_std and scale_std > 0:
+        P = scale_xyz(P, scale_std=scale_std, per_axis=per_axis_scale, rng=rng)
+    if jitter_sigma_mm and jitter_sigma_mm > 0:
+        P = jitter_xyz(P, sigma_mm=jitter_sigma_mm, rng=rng)
+    return P
+
+def make_augmented_batch_simple(xyz_resampled: np.ndarray, n_aug: int,
+                                jitter_sigma_mm: float = 1.5,
+                                scale_std: float = 0.03,
+                                per_axis_scale: bool = False,
+                                rng_seed: int = 42) -> List[np.ndarray]:
+    rng = np.random.RandomState(rng_seed)
+    return [
+        augment_one_simple(
+            xyz_resampled,
+            jitter_sigma_mm=jitter_sigma_mm,
+            scale_std=scale_std,
+            per_axis_scale=per_axis_scale,
+            rng=rng
+        )
+        for _ in range(n_aug)
+    ]
+
+def load_dataset(data_dir: Path, resample_len: int = 100,
+                 augment: bool = False, aug_per_sample: int = 0,
+                 jitter_sigma_mm: float = 1.5,
+                 scale_std: float = 0.03,
+                 per_axis_scale: bool = False,
+                 rng_seed: int = 42) -> Tuple[np.ndarray, np.ndarray, List[Path], List[str]]:
+    rng = np.random.RandomState(rng_seed)
+
+    X_list: List[np.ndarray] = []
+    y_list: List[int] = []
+    files: List[Path] = []
+    classes: List[str] = []
+
+    for class_dir in sorted([p for p in data_dir.iterdir() if p.is_dir()]):
+        classes.append(class_dir.name)
+    label_to_id: Dict[str, int] = {c: i for i, c in enumerate(classes)}
+
+    for xyz, label, path in iter_trajectories(data_dir):
+        xyz_res = resample_traj(xyz, n=resample_len)
+
+        # original
+        feats = extract_features(xyz_res)
+        X_list.append(feats); y_list.append(label_to_id[label]); files.append(path)
+
+        # augmentations simples (sans rot/warp)
+        if augment and aug_per_sample > 0:
+            for _ in range(aug_per_sample):
+                P_aug = augment_one_simple(
+                    xyz_res,
+                    jitter_sigma_mm=jitter_sigma_mm,
+                    scale_std=scale_std,
+                    per_axis_scale=per_axis_scale,
+                    rng=rng
+                )
+                feats_aug = extract_features(P_aug)
+                X_list.append(feats_aug); y_list.append(label_to_id[label]); files.append(path)
+
+    if not X_list:
+        raise RuntimeError("No trajectories found. Check your data_dir structure.")
+
+    X = np.vstack(X_list)
+    y = np.array(y_list, dtype=int)
+    return X, y, files, classes
 
 
 def parse_xyz_from_col6(line: str) -> np.ndarray:
@@ -124,40 +234,6 @@ def iter_trajectories(data_dir: Path) -> Iterator[Tuple[np.ndarray, str, Path]]:
             yield xyz, label, txt
 
 
-def load_dataset(data_dir: Path, resample_len: int = 100) -> Tuple[np.ndarray, np.ndarray, List[Path], List[str]]:
-    """
-    Build (X, y) from the directory structure, resampling each trajectory and extracting features.
-    Returns:
-      X: (N, F) features
-      y: (N,) labels (as integers 0..K-1)
-      files: list of file paths aligned with rows
-      label_names: list of class names indexed by label id
-    """
-    X_list: List[np.ndarray] = []
-    y_list: List[int] = []
-    files: List[Path] = []
-    classes: List[str] = []
-
-    # Collect class order
-    for class_dir in sorted([p for p in data_dir.iterdir() if p.is_dir()]):
-        classes.append(class_dir.name)
-    label_to_id: Dict[str, int] = {c: i for i, c in enumerate(classes)}
-
-    for xyz, label, path in iter_trajectories(data_dir):
-        xyz_res = resample_traj(xyz, n=resample_len)
-        feats = extract_features(xyz_res)
-        X_list.append(feats)
-        y_list.append(label_to_id[label])
-        files.append(path)
-
-    if not X_list:
-        raise RuntimeError("No trajectories found. Check your data_dir structure.")
-
-    X = np.vstack(X_list)
-    y = np.array(y_list, dtype=int)
-    return X, y, files, classes
-
-
 def plot_and_save_confusion_matrix(cm: np.ndarray, class_names: List[str], save_path: Path):
     fig = plt.figure(figsize=(6, 5))
     ax = fig.add_subplot(111)
@@ -179,42 +255,70 @@ def plot_and_save_confusion_matrix(cm: np.ndarray, class_names: List[str], save_
     plt.close(fig)
 
 
-def main():
-    parser = argparse.ArgumentParser(description="SVM (RBF) classifier on 3D trajectories from column [6], minimal version (no joblib).")
-    parser.add_argument("--data_dir", type=str, required=True, help="Root folder with class subfolders and .txt files")
-    parser.add_argument("--resample_len", type=int, default=100, help="Resampling length for trajectories")
-    parser.add_argument("--save_dir", type=str, default="./outputs", help="Directory to save artifacts")
-    parser.add_argument("--cv_splits", type=int, default=5, help="Stratified K-fold splits")
-    parser.add_argument("--save_npy", action="store_true", help="Optionally save features.npy and labels.npy")
-    args = parser.parse_args()
-
-    data_dir = Path(args.data_dir)
-    save_dir = Path(args.save_dir)
+def run(
+    data_dir: str,
+    resample_len: int = 100,
+    save_dir: str = "./outputs",
+    cv_splits: int = 5,
+    save_npy: bool = False,
+    augment: bool = False,
+    aug_per_sample: int = 0,
+    jitter_sigma_mm: float = 1.5,
+    scale_std: float = 0.03,
+    per_axis_scale: bool = False,
+    rng_seed: Optional[int] = None,
+):
+    data_dir = Path(data_dir)
+    save_dir = Path(save_dir)
     save_dir.mkdir(parents=True, exist_ok=True)
 
     print("Loading dataset from:", data_dir)
-    X, y, files, class_names = load_dataset(data_dir, resample_len=args.resample_len)
+    X, y, files, class_names = load_dataset(
+        data_dir,
+        resample_len=resample_len,
+        augment=augment,
+        aug_per_sample=aug_per_sample,
+        jitter_sigma_mm=jitter_sigma_mm,
+        scale_std=scale_std,
+        per_axis_scale=per_axis_scale,
+        rng_seed=int(time.time()) if rng_seed is None else int(rng_seed),
+    )
     print(f"Loaded {len(y)} trajectories; feature dim = {X.shape[1]}; classes = {class_names}")
+
+    first_xyz = read_trajectory_txt(files[4])  # (T,3)
+    first_res = resample_traj(first_xyz, n=resample_len)  # (n,3)
+    first_aug = augment_one_simple(
+        first_res,
+        jitter_sigma_mm=jitter_sigma_mm,
+        scale_std=scale_std,
+        per_axis_scale=per_axis_scale,
+        rng=np.random.RandomState(123)  # pour reproductibilité
+    )
+
 
     # Pipeline: Standardize -> SVM(RBF)
     clf = make_pipeline(
         StandardScaler(),
-        SVC(kernel="rbf", C=3.0, gamma="scale", class_weight="balanced", probability=True, random_state=42)
+        SVC(kernel="rbf", C=3.0, gamma="scale", class_weight="balanced",
+            probability=True, random_state=42)
     )
 
-    # Cross-validated F1-macro
-    cv = StratifiedKFold(n_splits=args.cv_splits, shuffle=True, random_state=42)
-    f1_scores = cross_val_score(clf, X, y, cv=cv, scoring="f1_macro")
+    # GroupKFold pour éviter la fuite entre originaux et augmentations
+    groups = [str(p) for p in files]
+    cv = GroupKFold(n_splits=cv_splits)
+
+    # CV F1-macro
+    f1_scores = cross_val_score(clf, X, y, cv=cv, scoring="f1_macro", groups=groups)
     print(f"CV F1-macro: {f1_scores.mean():.3f} ± {f1_scores.std():.3f}")
 
-    # Confusion matrix via cross_val_predict
-    y_pred = cross_val_predict(clf, X, y, cv=cv, method="predict")
+    # Prédictions CV et matrice de confusion
+    y_pred = cross_val_predict(clf, X, y, cv=cv, method="predict", groups=groups)
     cm = confusion_matrix(y, y_pred)
     cm_path = save_dir / "confusion_matrix.png"
     plot_and_save_confusion_matrix(cm, class_names, cm_path)
     print(f"Saved confusion matrix to: {cm_path}")
 
-    # Classification report per class
+    # Rapport de classification
     report = classification_report(y, y_pred, target_names=class_names, digits=3)
     report_path = save_dir / "classification_report.txt"
     with open(report_path, "w", encoding="utf-8") as f:
@@ -222,17 +326,42 @@ def main():
     print("Classification report:\n", report)
     print(f"Saved classification report to: {report_path}")
 
-    # (Optional) save precomputed features/labels for later analysis
-    if args.save_npy:
+    # Sauvegarde optionnelle des features/labels
+    if save_npy:
         np.save(save_dir / "features.npy", X)
         np.save(save_dir / "labels.npy", y)
         print("Saved features.npy and labels.npy")
 
-    # Fit on all data (kept in memory only; not persisted)
+    # Fit final sur tout le jeu
     clf.fit(X, y)
-    print("Model trained (in-memory only). No joblib export in this minimal version.")
 
     print("\nDone.")
+    return {
+        "model": clf,
+        "classes": class_names,
+        "features": X,
+        "labels": y,
+        "confusion_matrix": cm,
+        "f1_scores": f1_scores,
+        "report_path": str(report_path),
+        "cm_path": str(cm_path),
+    }
+
+
+def main():
+    run(
+        data_dir=r"../data1",
+        resample_len=100,
+        save_dir="./outputs",
+        cv_splits=5,
+        save_npy=False,
+        augment=True,
+        aug_per_sample=2,
+        jitter_sigma_mm=1.5,
+        scale_std=0.03,
+        per_axis_scale=False,
+        rng_seed=None,
+    )
 
 
 if __name__ == "__main__":
