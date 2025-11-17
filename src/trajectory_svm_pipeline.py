@@ -254,6 +254,43 @@ def plot_and_save_confusion_matrix(cm: np.ndarray, class_names: List[str], save_
     fig.savefig(save_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
 
+def plot_traj_3d(before: np.ndarray, after: np.ndarray, save_path: Path, title: str = "Avant / Après augmentation"):
+    """
+    Affiche et enregistre deux trajectoires 3D (avant, après) sur la même figure.
+    """
+    fig = plt.figure(figsize=(6, 6))
+    ax = fig.add_subplot(111, projection="3d")
+
+    # courbes
+    ax.plot(before[:,0], before[:,1], before[:,2], label="Avant", linewidth=2)
+    ax.plot(after[:,0],  after[:,1],  after[:,2],  label="Après", linestyle="--")
+
+    # points départ/arrivée
+    ax.scatter(before[0,0], before[0,1], before[0,2], marker="o")
+    ax.scatter(before[-1,0], before[-1,1], before[-1,2], marker="x")
+    ax.scatter(after[0,0],  after[0,1],  after[0,2],  marker="o")
+    ax.scatter(after[-1,0], after[-1,1], after[-1,2], marker="x")
+
+    # même échelle sur X/Y/Z pour une géométrie fidèle
+    def _set_equal_aspect(ax, P):
+        xs, ys, zs = P[:,0], P[:,1], P[:,2]
+        max_range = np.array([xs.max()-xs.min(), ys.max()-ys.min(), zs.max()-zs.min()]).max()
+        Xb = (xs.min()+xs.max())/2
+        Yb = (ys.min()+ys.max())/2
+        Zb = (zs.min()+zs.max())/2
+        r = max_range/2
+        ax.set_xlim(Xb-r, Xb+r)
+        ax.set_ylim(Yb-r, Yb+r)
+        ax.set_zlim(Zb-r, Zb+r)
+
+    _set_equal_aspect(ax, np.vstack([before, after]))
+
+    ax.set_title(title)
+    ax.set_xlabel("X"); ax.set_ylabel("Y"); ax.set_zlabel("Z")
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(save_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
 
 def run(
     data_dir: str,
@@ -295,6 +332,9 @@ def run(
         rng=np.random.RandomState(123)  # pour reproductibilité
     )
 
+    vis_path = save_dir / "traj_avant_apres_3d.png"
+    plot_traj_3d(first_res, first_aug, vis_path, title="Trajectoire 3D : avant / après")
+    print(f"Saved 3D trajectory visualization to: {vis_path}")
 
     # Pipeline: Standardize -> SVM(RBF)
     clf = make_pipeline(
