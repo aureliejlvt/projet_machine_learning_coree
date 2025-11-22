@@ -1,30 +1,27 @@
-import argparse
 import re
 from pathlib import Path
 from typing import Iterator, List, Tuple, Dict
-
-import numpy as np
-from sklearn.model_selection import StratifiedKFold, cross_val_score, cross_val_predict
+from sklearn.model_selection import cross_val_score, cross_val_predict
 from sklearn.preprocessing import StandardScaler
 from sklearn.pipeline import make_pipeline
 from sklearn.metrics import classification_report, confusion_matrix
-from sklearn.svm import SVC
-import matplotlib.pyplot as plt
 import time
-from mpl_toolkits.mplot3d import Axes3D  # utile selon versions de matplotlib
-
-
-# ---- AUGMENTATION SOBRE (pas de rotation, pas de time-warp) ----
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.tree import plot_tree
 from typing import Optional
 from sklearn.model_selection import GroupKFold
+import matplotlib.pyplot as plt
+import numpy as np
 
 _rng = np.random.RandomState(42)
+
 
 def jitter_xyz(xyz: np.ndarray, sigma_mm: float = 1.5,
                rng: Optional[np.random.RandomState] = None) -> np.ndarray:
     """Bruit gaussien i.i.d. (zéro-mean) sur chaque point, n'altère pas la longueur."""
     rng = rng or _rng
     return xyz + rng.normal(0.0, sigma_mm, size=xyz.shape)
+
 
 def scale_xyz(xyz: np.ndarray, scale_std: float = 0.03,
               per_axis: bool = False,
@@ -41,6 +38,7 @@ def scale_xyz(xyz: np.ndarray, scale_std: float = 0.03,
     else:
         s = float(np.clip(rng.normal(1.0, scale_std), 0.9, 1.1))
         return xyz * s
+
 
 def augment_one_simple(xyz_resampled: np.ndarray,
                        jitter_sigma_mm: float = 1.5,
@@ -60,6 +58,7 @@ def augment_one_simple(xyz_resampled: np.ndarray,
         P = jitter_xyz(P, sigma_mm=jitter_sigma_mm, rng=rng)
     return P
 
+
 def make_augmented_batch_simple(xyz_resampled: np.ndarray, n_aug: int,
                                 jitter_sigma_mm: float = 1.5,
                                 scale_std: float = 0.03,
@@ -76,6 +75,7 @@ def make_augmented_batch_simple(xyz_resampled: np.ndarray, n_aug: int,
         )
         for _ in range(n_aug)
     ]
+
 
 def load_dataset(data_dir: Path, resample_len: int = 100,
                  augment: bool = False, aug_per_sample: int = 0,
@@ -254,6 +254,7 @@ def plot_and_save_confusion_matrix(cm: np.ndarray, class_names: List[str], save_
     fig.savefig(save_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
 
+
 def plot_traj_3d(before: np.ndarray, after: np.ndarray, save_path: Path, title: str = "Avant / Après augmentation"):
     """
     Affiche et enregistre deux trajectoires 3D (avant, après) sur la même figure.
@@ -291,6 +292,7 @@ def plot_traj_3d(before: np.ndarray, after: np.ndarray, save_path: Path, title: 
     fig.tight_layout()
     fig.savefig(save_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
+
 
 def run(
     data_dir: str,
@@ -336,11 +338,16 @@ def run(
     plot_traj_3d(first_res, first_aug, vis_path, title="Trajectoire 3D : avant / après")
     print(f"Saved 3D trajectory visualization to: {vis_path}")
 
-    # Pipeline: Standardize -> SVM(RBF)
+    # Pipeline: RobustScaler -> RandomForest
     clf = make_pipeline(
-        StandardScaler(),
-        SVC(kernel="rbf", C=3.0, gamma="scale", class_weight="balanced",
-            probability=True, random_state=42)
+        StandardScaler(),  # ou StandardScaler si tu ne veux pas changer ça tout de suite
+        RandomForestClassifier(
+            n_estimators=400,
+            max_depth=None,
+            class_weight="balanced",
+            random_state=42,
+            n_jobs=-1
+        )
     )
 
     # GroupKFold pour éviter la fuite entre originaux et augmentations
@@ -374,6 +381,34 @@ def run(
 
     # Fit final sur tout le jeu
     clf.fit(X, y)
+
+    # après avoir fit ton modèle :
+    rf = clf.named_steps["randomforestclassifier"]  # récupère le RF depuis le pipeline
+
+    feature_names = [
+        "length", "disp", "rectilinearity",
+        "amp_x", "amp_y", "amp_z",
+        "var_x", "var_y", "var_z",
+        "mean_x", "mean_y", "mean_z",
+        "azim", "elev", "turn_var",
+        "closure_ratio", "speed_mean", "speed_std"
+    ]
+
+    plt.figure(figsize=(18, 12))
+    plot_tree(
+        rf.estimators_[0],  # l'arbre n°0
+        feature_names=feature_names,  # liste de tes features
+        class_names=class_names,
+        max_depth=4,  # pour éviter un arbre trop énorme
+        filled=True,
+        fontsize=8
+    )
+
+    tree_path = save_dir / "example_tree.png"
+    plt.tight_layout()
+    plt.savefig(tree_path, dpi=200)
+    plt.close()
+    print(f"Saved example decision tree to: {tree_path.resolve()}")
 
     print("\nDone.")
     return {
